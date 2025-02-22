@@ -1,134 +1,277 @@
 #![allow(unexpected_cfgs)]
 use anchor_lang::prelude::*;
-use anchor_spl::token::{self, Token};
+use anchor_spl::token::{self, Token, TokenAccount, Mint};
 
-// Declare the program ID
+// Program ID for deployment
 declare_id!("D3LMDue6hQpkjM5SUFcFnc5i2GH9Qk2FjNwngGG5Zhfe");
 
+/// Token Distribution Program
+/// Implements the formula: Ri = (Ti/Ttotal) × X where:
+/// - Ri: Rewards for account i
+/// - Ti: Number of tokens held by account i
+/// - Ttotal: Total tokens held by all eligible accounts (>1K tokens)
+/// - X: Total rewards to distribute
 #[program]
 pub mod token_distributor {
     use super::*;
 
-    /// Initialize the distributor contract
-    /// Sets up the basic parameters for token distribution
+    /// Initialize the distributor program
+    /// Sets up initial state and configuration for token distribution
+    /// Parameters required:
+    /// - State account to store distribution data
+    /// - Token mint for the rewards
+    /// - Authority who can manage distributions
+    /// - Vault authority PDA for secure token management
     pub fn initialize(ctx: Context<Initialize>) -> Result<()> {
-        let distributor = &mut ctx.accounts.distributor;
+        let state = &mut ctx.accounts.state;
         
-        // Set the authority and token mint
-        distributor.authority = ctx.accounts.authority.key();
-        distributor.xyz_mint = ctx.accounts.xyz_mint.key();
-        
-        // Set distribution interval to 10 minutes (in seconds)
-        distributor.distribution_interval = 600;
-        
-        // Set initial distribution timestamp
-        distributor.last_distribution = Clock::get()?.unix_timestamp;
+        // Set the admin authority who can manage distributions
+        state.authority = ctx.accounts.authority.key();
+        // Set token mint for reward tracking
+        state.token_mint = ctx.accounts.token_mint.key();
+        // Set minimum token requirement to 1K tokens
+        state.min_token_threshold = 1000; // Only accounts with >1K tokens are eligible
+        // Initialize Ttotal (total eligible tokens) to 0
+        state.total_eligible_tokens = 0;   
+        // Set initial timestamp for distribution tracking
+        state.last_distribution = Clock::get()?.unix_timestamp;
+        // Set distribution interval to 10 minutes (600 seconds)
+        state.distribution_interval = 600; 
+        // Initialize distribution state flag
+        state.is_distribution_active = false;
         
         Ok(())
     }
 
-    /// Distribute rewards to token holders
-    /// Calculates and transfers rewards based on holder's token balance
-    pub fn distribute_rewards(ctx: Context<DistributeRewards>) -> Result<()> {
-        let distributor = &mut ctx.accounts.distributor;
+    /// Start a new distribution cycle
+    /// This must be called before calculating rewards
+    /// Checks:
+    /// - Enough time has passed since last distribution
+    /// - No distribution is currently active
+    pub fn start_distribution(ctx: Context<StartDistribution>) -> Result<()> {
+        let state = &mut ctx.accounts.state;
         let clock = Clock::get()?;
-        
-        // Check if enough time has passed since last distribution
+
+        // Verify distribution interval has passed
         require!(
-            clock.unix_timestamp >= distributor.last_distribution + distributor.distribution_interval,
+            clock.unix_timestamp >= state.last_distribution + state.distribution_interval,
             DistributorError::TooEarlyForDistribution
         );
 
-        // Get total supply and current reward amount
-        let mint_data = ctx.accounts.xyz_mint.try_borrow_data()?;
-        let total_supply = u64::from_le_bytes(mint_data[36..44].try_into().unwrap());
-        let vault_data = ctx.accounts.reward_vault.try_borrow_data()?;
-        let reward_amount = u64::from_le_bytes(vault_data[64..72].try_into().unwrap());
+        // Ensure no other distribution is in progress
+        require!(
+            !state.is_distribution_active,
+            DistributorError::DistributionInProgress
+        );
 
-        // Calculate holder's share based on their balance
-        let holder_data = ctx.accounts.holder_token_account.try_borrow_data()?;
-        let holder_balance = u64::from_le_bytes(holder_data[64..72].try_into().unwrap());
+        // Reset Ttotal for new calculation
+        state.total_eligible_tokens = 0;
+        // Mark distribution as active
+        state.is_distribution_active = true;
+
+        Ok(())
+    }
+
+    /// Calculate total eligible tokens (Ttotal)
+    /// Processes a batch of token accounts to sum up total eligible tokens
+    /// Only includes accounts with more than 1K tokens
+    /// This implements the summation of Ti for all eligible accounts
+    pub fn calculate_total_eligible_tokens<'info>(
+        ctx: Context<'_, '_, 'info, 'info, CalculateTotal<'info>>,
+        _batch_size: u64,
+    ) -> Result<()> {
+        let state = &mut ctx.accounts.state;
         
-        let holder_share = (holder_balance
-            .checked_mul(reward_amount)
+        // Verify distribution is active
+        require!(
+            state.is_distribution_active,
+            DistributorError::DistributionNotStarted
+        );
+
+        // Calculate Ttotal by summing Ti for all eligible accounts
+        for account_info in ctx.remaining_accounts {
+            let token_account = Account::<'info, TokenAccount>::try_from(account_info)?;
+            
+            // Only include Ti if account has more than 1K tokens
+            if token_account.amount >= state.min_token_threshold {
+                // Add Ti to Ttotal
+                state.total_eligible_tokens = state.total_eligible_tokens
+                    .checked_add(token_account.amount)
+                    .ok_or(DistributorError::CalculationError)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Distribute rewards to a single token holder
+    /// Implements the formula: Ri = (Ti/Ttotal) × X
+    /// Where:
+    /// - Ri = rewards for this account
+    /// - Ti = tokens held by this account
+    /// - Ttotal = total eligible tokens (calculated previously)
+    /// - X = total rewards available to distribute
+    pub fn distribute_rewards(ctx: Context<DistributeRewards>) -> Result<()> {
+        let state = &mut ctx.accounts.state;
+        
+        // Verify distribution is active
+        require!(
+            state.is_distribution_active,
+            DistributorError::DistributionNotStarted
+        );
+
+        // Get Ti (tokens held by this account)
+        let tokens_held_by_account = ctx.accounts.holder_token_account.amount;
+        
+        // Verify account meets minimum token requirement
+        require!(
+            tokens_held_by_account >= state.min_token_threshold,
+            DistributorError::InsufficientBalance
+        );
+
+        // Get X (total rewards available to distribute)
+        let total_rewards_to_distribute = ctx.accounts.reward_vault.amount;
+
+        // Calculate Ri using the formula: Ri = (Ti/Ttotal) × X
+        // First multiply Ti × X to maintain precision
+        let rewards = (tokens_held_by_account  // Ti
+            .checked_mul(total_rewards_to_distribute)  // × X
             .ok_or(DistributorError::CalculationError)?
         )
-            .checked_div(total_supply)
+            // Then divide by Ttotal
+            .checked_div(state.total_eligible_tokens)  // ÷ Ttotal
             .ok_or(DistributorError::CalculationError)?;
 
-        // Set up PDA signer for vault authority
-        let seeds = &[
-            b"vault".as_ref(),
-            &[ctx.bumps.vault_authority],
-        ];
-        let signer = &[&seeds[..]];
+        // Only transfer if account is eligible for rewards
+        if rewards > 0 {
+            // Set up PDA signer for secure vault access
+            let seeds = &[
+                b"vault".as_ref(),
+                &[ctx.bumps.vault_authority],
+            ];
+            let signer = &[&seeds[..]];
 
-        // Transfer tokens to holder
-        token::transfer(
-            CpiContext::new_with_signer(
-                ctx.accounts.token_program.to_account_info(),
-                token::Transfer {
-                    from: ctx.accounts.reward_vault.to_account_info(),
-                    to: ctx.accounts.holder_token_account.to_account_info(),
-                    authority: ctx.accounts.vault_authority.to_account_info(),
-                },
-                signer,
-            ),
-            holder_share,
-        )?;
+            // Transfer Ri tokens to holder
+            token::transfer(
+                CpiContext::new_with_signer(
+                    ctx.accounts.token_program.to_account_info(),
+                    token::Transfer {
+                        from: ctx.accounts.reward_vault.to_account_info(),
+                        to: ctx.accounts.holder_token_account.to_account_info(),
+                        authority: ctx.accounts.vault_authority.to_account_info(),
+                    },
+                    signer,
+                ),
+                rewards,  // Amount = Ri from formula
+            )?;
+        }
 
-        // Update last distribution timestamp
-        distributor.last_distribution = clock.unix_timestamp;
+        Ok(())
+    }
+
+    /// End the current distribution cycle
+    /// Updates timestamps and resets distribution state
+    pub fn end_distribution(ctx: Context<EndDistribution>) -> Result<()> {
+        let state = &mut ctx.accounts.state;
         
+        // Verify distribution is active
+        require!(
+            state.is_distribution_active,
+            DistributorError::DistributionNotStarted
+        );
+
+        // Mark distribution as complete
+        state.is_distribution_active = false;
+        // Update last distribution timestamp
+        state.last_distribution = Clock::get()?.unix_timestamp;
+
         Ok(())
     }
 }
 
-/// Accounts required for initializing the distributor
+/// Initialize instruction accounts
 #[derive(Accounts)]
 pub struct Initialize<'info> {
-    // Initialize the distributor account
+    // State account to store distribution data
     #[account(
         init,
         payer = authority,
-        space = 8 + 32 + 32 + 8 + 8
+        space = DistributorState::SIZE
     )]
-    pub distributor: Account<'info, Distributor>,
+    pub state: Account<'info, DistributorState>,
     
-    // The mint of the token being distributed
-    /// CHECK: Token mint account
-    pub xyz_mint: AccountInfo<'info>,
+    // Token mint for the rewards
+    pub token_mint: Account<'info, Mint>,
     
-    // The authority who pays for initialization
+    // Authority who manages distributions
     #[account(mut)]
     pub authority: Signer<'info>,
+
+    // PDA that acts as vault authority
+    #[account(
+        init,
+        payer = authority,
+        space = 8,
+        seeds = [b"vault"],
+        bump
+    )]
+    pub vault_authority: Account<'info, VaultAuthority>,
     
-    // Required system program
     pub system_program: Program<'info, System>,
 }
 
-/// Accounts required for distributing rewards
+/// Start distribution instruction accounts
+#[derive(Accounts)]
+pub struct StartDistribution<'info> {
+    // Must be signed by authority
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    
+    // State account must be mutable and owned by authority
+    #[account(
+        mut,
+        has_one = authority,
+    )]
+    pub state: Account<'info, DistributorState>,
+}
+
+/// Calculate total supply instruction accounts
+#[derive(Accounts)]
+pub struct CalculateTotal<'info> {
+    // Must be signed by authority
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    
+    // State account must be mutable and owned by authority
+    #[account(
+        mut,
+        has_one = authority,
+    )]
+    pub state: Account<'info, DistributorState>,
+}
+
+/// Distribute rewards instruction accounts
 #[derive(Accounts)]
 pub struct DistributeRewards<'info> {
-    // The distributor account
+    // State account storing distribution data
     #[account(mut)]
-    pub distributor: Account<'info, Distributor>,
+    pub state: Account<'info, DistributorState>,
     
-    // The token mint
-    /// CHECK: Token mint account verified in constraints
-    pub xyz_mint: AccountInfo<'info>,
+    // Token mint for verification
+    pub token_mint: Account<'info, Mint>,
     
-    // The token account of the holder receiving rewards
-    /// CHECK: Token account verified in program logic
+    // Holder's token account receiving rewards
+    #[account(
+        mut,
+        constraint = holder_token_account.mint == token_mint.key()
+    )]
+    pub holder_token_account: Account<'info, TokenAccount>,
+    
+    // Vault holding rewards to distribute
     #[account(mut)]
-    pub holder_token_account: AccountInfo<'info>,
+    pub reward_vault: Account<'info, TokenAccount>,
     
-    // The vault holding rewards to be distributed
-    /// CHECK: Token account verified in program logic
-    #[account(mut)]
-    pub reward_vault: AccountInfo<'info>,
-    
-    // The PDA that acts as the vault authority
+    // PDA that controls the reward vault
     /// CHECK: PDA used as vault authority
     #[account(
         seeds = [b"vault"],
@@ -136,35 +279,68 @@ pub struct DistributeRewards<'info> {
     )]
     pub vault_authority: UncheckedAccount<'info>,
     
-    // The holder receiving rewards
-    pub holder: SystemAccount<'info>,
-    
-    // The token program
+    // Token program for transfers
     pub token_program: Program<'info, Token>,
 }
 
-/// The distributor account data structure
-#[account]
-pub struct Distributor {
-    // The authority who initialized the distributor
-    pub authority: Pubkey,
+/// End distribution instruction accounts
+#[derive(Accounts)]
+pub struct EndDistribution<'info> {
+    // Must be signed by authority
+    #[account(mut)]
+    pub authority: Signer<'info>,
     
-    // The mint address of the token
-    pub xyz_mint: Pubkey,
-    
-    // The interval between distributions in seconds
-    pub distribution_interval: i64,
-    
-    // Timestamp of the last distribution
-    pub last_distribution: i64,
+    // State account must be mutable and owned by authority
+    #[account(
+        mut,
+        has_one = authority,
+    )]
+    pub state: Account<'info, DistributorState>,
 }
 
-/// Custom error codes for the distributor program
+/// State account storing distribution configuration and tracking
+#[account]
+pub struct DistributorState {
+    pub authority: Pubkey,             // Admin who can manage distributions
+    pub token_mint: Pubkey,            // Token mint being distributed
+    pub min_token_threshold: u64,      // Minimum tokens required (1K)
+    pub total_eligible_tokens: u64,    // Ttotal in the formula
+    pub distribution_interval: i64,    // Time between distributions
+    pub last_distribution: i64,        // Last distribution timestamp
+    pub is_distribution_active: bool,  // Distribution state flag
+}
+
+/// Empty account that acts as vault authority
+#[account]
+pub struct VaultAuthority {}
+
+/// Calculate required account sizes
+impl DistributorState {
+    pub const SIZE: usize = 8 +    // Account discriminator
+        32 +   // authority: Pubkey
+        32 +   // token_mint: Pubkey
+        8 +    // min_token_threshold: u64
+        8 +    // total_eligible_tokens: u64
+        8 +    // distribution_interval: i64
+        8 +    // last_distribution: i64
+        1;     // is_distribution_active: bool
+}
+
+/// Program error codes
 #[error_code]
 pub enum DistributorError {
-    #[msg("Not enough time has passed since last distribution")]
+    #[msg("Distribution cannot start yet - interval not elapsed")]
     TooEarlyForDistribution,
     
     #[msg("Error in reward calculation")]
     CalculationError,
+
+    #[msg("Distribution is already in progress")]
+    DistributionInProgress,
+
+    #[msg("Distribution has not been started")]
+    DistributionNotStarted,
+
+    #[msg("Insufficient token balance - minimum 1K tokens required")]
+    InsufficientBalance,
 }
